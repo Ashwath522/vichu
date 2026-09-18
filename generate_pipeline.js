@@ -18,6 +18,7 @@ const STATE_DIR = path.join(BASE_DIR, 'state');
 const TRACKER_FILE = path.join(STATE_DIR, 'repetition_tracker.json');
 const SWITCH_LOG = path.join(OUTPUT_DIR, 'provider_switch.log');
 const FAILED_LOG = path.join(OUTPUT_DIR, 'failed_items.log');
+const QUALITY_LOG = path.join(OUTPUT_DIR, 'quality_warnings.log');
 
 // Ensure output and state directories exist
 [INPUT_DIR, OUTPUT_DIR, STATE_DIR].forEach((dir) => {
@@ -34,6 +35,12 @@ const GROQ_MODEL = 'qwen/qwen3.8-27b';
 const GEMINI_MODEL = 'gemini-2.5-flash';
 
 let active_provider = 'Grok'; // Starts with Grok as requested
+
+// Groq's free tier caps output tokens per minute quite low (observed: 1000 OTPM),
+// so calls need real spacing or both providers end up rate-limited back-to-back.
+const PACING_MS = parseInt(process.env.PACING_MS || '4000', 10);
+const COOLDOWN_MIN_MS = parseInt(process.env.COOLDOWN_MIN_MS || '4000', 10);
+const COOLDOWN_MAX_MS = parseInt(process.env.COOLDOWN_MAX_MS || '20000', 10);
 
 // ── Stopwords (Common English function words & bullet labels) ───────────────
 const STOPWORDS = new Set([
@@ -59,6 +66,12 @@ function logFailedItem(productId, productName, category, reason) {
   const timestamp = new Date().toISOString();
   const entry = `[${timestamp}] FAILED: ID=${productId} | Category=${category} | Name="${productName}" | Reason=${reason}\n`;
   fs.appendFileSync(FAILED_LOG, entry, 'utf8');
+}
+
+function logQualityWarning(productId, productName, category, details) {
+  const timestamp = new Date().toISOString();
+  const entry = `[${timestamp}] QUALITY_ISSUE_KEPT: ID=${productId} | Category=${category} | Name="${productName}" | Details=${JSON.stringify(details)}\n`;
+  fs.appendFileSync(QUALITY_LOG, entry, 'utf8');
 }
 
 // ── Repetition Tracker Management ───────────────────────────────────────────
@@ -171,6 +184,21 @@ function updateTrackerWithContent(tracker, openingLine, fullContent) {
   }
 }
 
+// ── Word-count enforcement (70-110 words per description) ──────────────────
+const MIN_WORDS = 70;
+const MAX_WORDS = 110;
+
+function countWords(text) {
+  return String(text || '').trim().split(/\s+/).filter(Boolean).length;
+}
+
+// ── Hard restricted-word check (actually blocks reuse instead of just asking nicely) ──
+function findRestrictedWordsUsed(content, restrictedWords) {
+  if (!restrictedWords || restrictedWords.length === 0) return [];
+  const usedTokens = new Set(tokenizeWords(content));
+  return restrictedWords.filter((w) => usedTokens.has(w));
+}
+
 // ── Prompt Assembly ─────────────────────────────────────────────────────────
 function buildPrompt(category, product, repetitionContext, extraInstruction = '') {
   const cleanProduct = {
@@ -199,7 +227,8 @@ RULES:
 - NEVER use negative phrasing (no "not suitable for," "avoid," "without," "indoor use only," etc.) — state only what the product positively offers.
 - Do not invent facts — use only fields present in the input JSON.
 - Paragraph: 3-5 sentences. Bullets: material, finish/color options, capacity/storage type, warranty, pairing info — only from given fields.
-- Word limit is 70-110 .
+- The FULL assistant content (narrative paragraph + bullets combined) MUST be between ${MIN_WORDS} and ${MAX_WORDS} words. Count carefully before responding — this is a hard requirement, not a suggestion.
+- NEVER use any word listed under "Restricted words" in REPETITION_CONTEXT below, even as a synonym-adjacent form (e.g. "elegant"/"elegance" count as the same word). Pick a genuinely different word.
 INPUT: One product JSON object (category: ${category}).
 ${JSON.stringify(cleanProduct, null, 2)}
 
@@ -351,7 +380,7 @@ async function generateForProduct(category, product, tracker, extraInstruction =
         logSwitch(active_provider, nextProvider, err.message);
         console.log(`\n  >> RATE LIMIT on ${active_provider}. Switching to ${nextProvider}...`);
         active_provider = nextProvider;
-        const cooldownMs = Math.min(15000, Math.max(3000, Math.ceil((err.waitSecs || 6) * 1000)));
+        const cooldownMs = Math.min(COOLDOWN_MAX_MS, Math.max(COOLDOWN_MIN_MS, Math.ceil((err.waitSecs || 6) * 1000)));
         await new Promise((r) => setTimeout(r, cooldownMs));
         // Retry immediately on new provider
         try {
@@ -457,19 +486,45 @@ async function runPipeline() {
         continue;
       }
 
-      // 2. Repetition check on opening line
+      // 2. Quality checks: opening-line repetition, word count, restricted-word reuse
       let assistantText = res.json.messages[2].content;
       let openingLine = extractOpeningLine(assistantText);
       const similarPrior = checkOpeningFuzzySimilarity(openingLine, tracker.opening_lines);
+      const wc = countWords(assistantText);
+      const wordCountBad = wc < MIN_WORDS || wc > MAX_WORDS;
+      const restrictedUsed = findRestrictedWordsUsed(assistantText, tracker.restricted_words);
 
-      if (similarPrior) {
-        // Regenerate the SAME product once more with explicit instruction appended
-        const retryInstruction = `Your previous opening was too similar to: '${similarPrior}'. Generate a structurally different opening this time.`;
+      if (similarPrior || wordCountBad || restrictedUsed.length > 0) {
+        const issues = [];
+        if (similarPrior) {
+          issues.push(`Your previous opening was too similar to: '${similarPrior}'. Generate a structurally different opening this time.`);
+        }
+        if (wordCountBad) {
+          issues.push(`Your previous draft was ${wc} words, which is outside the required ${MIN_WORDS}-${MAX_WORDS} word range. Rewrite to land inside that range.`);
+        }
+        if (restrictedUsed.length > 0) {
+          issues.push(`Your previous draft reused these overused words: ${restrictedUsed.join(', ')}. Do not use them or close synonyms — pick genuinely different words.`);
+        }
+        const retryInstruction = issues.join(' ');
         const retryRes = await generateForProduct(item.category, product, tracker, retryInstruction);
         if (retryRes.success) {
-          res = retryRes;
-          assistantText = res.json.messages[2].content;
-          openingLine = extractOpeningLine(assistantText);
+          const retryWc = countWords(retryRes.json.messages[2].content);
+          const retryRestricted = findRestrictedWordsUsed(retryRes.json.messages[2].content, tracker.restricted_words);
+          // Only accept the retry if it's a genuine improvement; otherwise keep original
+          if (retryWc >= MIN_WORDS && retryWc <= MAX_WORDS && retryRestricted.length <= restrictedUsed.length) {
+            res = retryRes;
+            assistantText = res.json.messages[2].content;
+            openingLine = extractOpeningLine(assistantText);
+          } else {
+            // Log persistent quality issue so it's visible without failing the item
+            const qProductId = product.uid || product.sku || product.name;
+            logQualityWarning(qProductId, product.name, item.category, {
+              wordCount: wordCountBad ? wc : null,
+              retryWordCount: retryWc,
+              restrictedUsed,
+              similarPrior,
+            });
+          }
         }
       }
 
@@ -483,8 +538,8 @@ async function runPipeline() {
       totalProcessed++;
       console.log(`[${item.category}] [${indexNum}/${products.length}] [${res.provider}] [OK]`);
 
-      // Pacing delay between calls (2000ms for stable token replenishment)
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // Pacing delay between calls (configurable via PACING_MS; Groq's low OTPM cap needs real spacing)
+      await new Promise((resolve) => setTimeout(resolve, PACING_MS));
     }
   }
 
@@ -536,4 +591,8 @@ module.exports = {
   tokenizeWords,
   buildPrompt,
   parseAndValidateChatJson,
+  countWords,
+  findRestrictedWordsUsed,
+  MIN_WORDS,
+  MAX_WORDS,
 };
